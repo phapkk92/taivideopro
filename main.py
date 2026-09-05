@@ -3,8 +3,12 @@ import re
 import sys
 import glob
 import time
+import json
 import shutil
+import unicodedata
 import urllib.parse
+import urllib.request
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -15,7 +19,6 @@ import yt_dlp
 
 # Tự động tìm ffmpeg
 def get_ffmpeg_path():
-    # 1. Kiểm tra file ffmpeg.exe trong cùng thư mục
     base_dir = os.path.dirname(os.path.abspath(__file__))
     local_ffmpeg = os.path.join(base_dir, "ffmpeg.exe")
     if os.path.exists(local_ffmpeg):
@@ -24,14 +27,12 @@ def get_ffmpeg_path():
     if os.path.exists(parent_ffmpeg):
         return parent_ffmpeg
 
-    # 2. Kiểm tra imageio_ffmpeg nếu có
     try:
         import imageio_ffmpeg
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         pass
 
-    # 3. Kiểm tra PATH hệ thống
     ffmpeg_in_path = shutil.which("ffmpeg")
     if ffmpeg_in_path:
         return ffmpeg_in_path
@@ -42,7 +43,7 @@ FFMPEG_PATH = get_ffmpeg_path()
 TEMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_downloads")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-app = FastAPI(title="SnapDownload Pro API", version="3.0.0")
+app = FastAPI(title="SnapDownload Pro API", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -72,10 +73,25 @@ def format_size(bytes_val):
     return f"{mb:.1f} MB"
 
 def sanitize_filename(name):
-    # Loại bỏ ký tự cấm trong tên file Windows
-    clean = re.sub(r'[\\/*?:"<>|]', "", name)
+    clean = re.sub(r'[\/*?:"<>|]', "", name)
     clean = clean.strip().replace("\n", " ").replace("\r", "")
-    return clean[:100] if len(clean) > 100 else clean
+    return clean[:80] if len(clean) > 80 else clean
+
+def make_safe_content_disposition(title: str, ext: str) -> str:
+    """Tạo header Content-Disposition chuẩn RFC 5987 hỗ trợ tiếng Việt mà không bị lỗi latin-1"""
+    safe_title = sanitize_filename(title or "video")
+    
+    # Tạo tên ascii không dấu
+    nfkd = unicodedata.normalize('NFKD', safe_title)
+    no_accent = "".join([c for c in nfkd if not unicodedata.combining(c)])
+    ascii_clean = re.sub(r'[^a-zA-Z0-9_\-\. ]', '', no_accent).strip()
+    if not ascii_clean:
+        ascii_clean = "download"
+    ascii_filename = f"{ascii_clean}.{ext}"
+
+    # Mã hóa UTF-8 cho tên file có dấu
+    encoded_filename = urllib.parse.quote(f"{safe_title}.{ext}")
+    return f'attachment; filename="{ascii_filename}"; filename*=UTF-8\'\'{encoded_filename}'
 
 def cleanup_file(path: str):
     """Xóa file tạm sau khi gửi xong"""
@@ -85,6 +101,76 @@ def cleanup_file(path: str):
     except Exception as e:
         print(f"Error cleaning up file {path}: {e}")
 
+def is_tiktok_url(url: str) -> bool:
+    u = url.lower()
+    return "tiktok.com" in u or "douyin.com" in u
+
+def fetch_tiktok_tikwm(url: str):
+    """Trích xuất video TikTok không logo qua TikWM API"""
+    try:
+        api_url = f"https://www.tikwm.com/api/?url={urllib.parse.quote(url)}"
+        req = urllib.request.Request(
+            api_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("code") == 0:
+                d = data.get("data", {})
+                raw_title = d.get("title") or "Video TikTok không logo"
+                clean_title = raw_title.replace("\n", " ").strip()
+                author_name = d.get("author", {}).get("nickname") or d.get("author", {}).get("unique_id") or "@tiktok"
+                thumbnail = d.get("cover") or ""
+                duration_sec = d.get("duration") or 0
+                duration_str = format_duration(duration_sec)
+                
+                play_url = d.get("hdplay") or d.get("play")
+                music_url = d.get("music")
+                size_mb = format_size(d.get("size")) or (f"{max(3, int(duration_sec * 0.25))} MB" if duration_sec else "Gốc")
+
+                formats = []
+                # 1. Video không logo chất lượng cao
+                if play_url:
+                    formats.append({
+                        "quality": "HD Không logo (Watermark)",
+                        "type": "MP4 Không logo",
+                        "size": size_mb,
+                        "format_id": "tiktok_hd",
+                        "url": f"/api/download?url={urllib.parse.quote(url)}&direct_url={urllib.parse.quote(play_url)}&type=video&title={urllib.parse.quote(clean_title)}"
+                    })
+                # 2. Video SD nếu có
+                if d.get("play") and d.get("hdplay") and d.get("play") != d.get("hdplay"):
+                    formats.append({
+                        "quality": "Tiêu chuẩn (SD Không logo)",
+                        "type": "MP4 Không logo",
+                        "size": "SD",
+                        "format_id": "tiktok_sd",
+                        "url": f"/api/download?url={urllib.parse.quote(url)}&direct_url={urllib.parse.quote(d.get('play'))}&type=video&title={urllib.parse.quote(clean_title)}"
+                    })
+                # 3. Âm thanh gốc MP3
+                if music_url:
+                    formats.append({
+                        "quality": "Âm thanh gốc",
+                        "type": "MP3 320kbps",
+                        "size": f"{max(1, int(duration_sec * 0.04)):.1f} MB",
+                        "format_id": "tiktok_audio",
+                        "url": f"/api/download?url={urllib.parse.quote(url)}&direct_url={urllib.parse.quote(music_url)}&type=audio&title={urllib.parse.quote(clean_title)}"
+                    })
+
+                return {
+                    "platform": "TikTok",
+                    "title": clean_title,
+                    "thumbnail": thumbnail,
+                    "duration": duration_str,
+                    "author": author_name,
+                    "formats": formats
+                }
+    except Exception as e:
+        print(f"TikWM fetch error: {e}")
+    return None
+
 def get_base_ydl_opts():
     opts = {
         'quiet': True,
@@ -92,8 +178,7 @@ def get_base_ydl_opts():
         'noplaylist': True,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
         'extractor_args': {
-            'youtube': {'player_client': ['android', 'web']},
-            'tiktok': {'api_hostname': 'api16-normal-c-useast5.tiktokv.com'}
+            'youtube': {'player_client': ['android', 'web']}
         }
     }
     if FFMPEG_PATH:
@@ -132,6 +217,13 @@ def get_info(url: str = Query(..., description="Video URL từ bất kỳ nền 
     if not clean_url:
         raise HTTPException(status_code=400, detail="Vui lòng dán liên kết video hợp lệ!")
 
+    # 1. Nếu là link TikTok/Douyin: dùng TikWM API chuyên dụng cực nhanh, không logo 100%
+    if is_tiktok_url(clean_url):
+        tiktok_res = fetch_tiktok_tikwm(clean_url)
+        if tiktok_res and tiktok_res.get("formats"):
+            return tiktok_res
+
+    # 2. Xử lý qua yt-dlp cho mọi nền tảng khác
     ydl_opts = get_base_ydl_opts()
     ydl_opts['skip_download'] = True
 
@@ -140,16 +232,14 @@ def get_info(url: str = Query(..., description="Video URL từ bất kỳ nền 
             try:
                 info = ydl.extract_info(clean_url, download=False)
             except Exception as first_err:
-                # Fallback với extractor mặc định
                 if 'extractor_args' in ydl_opts:
                     del ydl_opts['extractor_args']
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl_retry:
                     info = ydl_retry.extract_info(clean_url, download=False)
 
             if not info:
-                raise HTTPException(status_code=400, detail="Không tìm thấy thông tin video!")
+                raise HTTPException(status_code=400, detail="Không tìm thấy thông tin video từ liên kết này!")
 
-            # Nếu là playlist, lấy video đầu tiên
             if 'entries' in info and info['entries']:
                 info = info['entries'][0]
 
@@ -160,17 +250,14 @@ def get_info(url: str = Query(..., description="Video URL từ bất kỳ nền 
             author = info.get('uploader') or info.get('channel') or info.get('creator') or "@creator"
             platform = detect_platform_name(info.get('extractor'), clean_url)
 
-            # Phân tích các format chất lượng
             formats = info.get('formats') or []
             video_height = info.get('height') or 1080
 
-            # Ước lượng dung lượng
             filesize = info.get('filesize') or info.get('filesize_approx')
             size_best = format_size(filesize) or (f"{max(5, int(duration_sec * 0.35))} MB" if duration_sec else "Gốc")
 
             results = []
 
-            # 1. Định dạng Tốt nhất (1080p hoặc chất lượng gốc cao nhất)
             results.append({
                 "quality": f"{video_height}p Full HD" if video_height >= 1080 else f"{video_height}p HD - Gốc",
                 "type": "MP4 + âm thanh",
@@ -179,7 +266,6 @@ def get_info(url: str = Query(..., description="Video URL từ bất kỳ nền 
                 "url": f"/api/download?url={urllib.parse.quote(clean_url)}&format_id=best&type=video&title={urllib.parse.quote(title)}"
             })
 
-            # 2. Định dạng 720p HD (nếu video gốc >= 720p)
             if video_height > 720:
                 size_720 = format_size(int(filesize * 0.6)) if filesize else (f"{max(3, int(duration_sec * 0.2))} MB" if duration_sec else "720p")
                 results.append({
@@ -190,7 +276,6 @@ def get_info(url: str = Query(..., description="Video URL từ bất kỳ nền 
                     "url": f"/api/download?url={urllib.parse.quote(clean_url)}&format_id=720&type=video&title={urllib.parse.quote(title)}"
                 })
 
-            # 3. Định dạng Tiết kiệm 480p / 360p
             if video_height > 480:
                 size_480 = format_size(int(filesize * 0.35)) if filesize else (f"{max(2, int(duration_sec * 0.12))} MB" if duration_sec else "SD")
                 results.append({
@@ -201,7 +286,6 @@ def get_info(url: str = Query(..., description="Video URL từ bất kỳ nền 
                     "url": f"/api/download?url={urllib.parse.quote(clean_url)}&format_id=480&type=video&title={urllib.parse.quote(title)}"
                 })
 
-            # 4. Định dạng Âm thanh MP3
             audio_size = (f"{max(1, int(duration_sec * 0.04)):.1f} MB" if duration_sec else "Âm thanh")
             results.append({
                 "quality": "Âm thanh gốc",
@@ -234,7 +318,8 @@ def get_info(url: str = Query(..., description="Video URL từ bất kỳ nền 
 def download_video(
     background_tasks: BackgroundTasks,
     url: str = Query(..., description="Video URL"),
-    format_id: str = Query("best", description="ID định dạng hoặc chất lượng"),
+    direct_url: Optional[str] = Query(None, description="Direct URL nếu có"),
+    format_id: str = Query("best", description="ID định dạng"),
     type: str = Query("video", description="video hoặc audio"),
     title: Optional[str] = Query(None, description="Tên video")
 ):
@@ -242,13 +327,54 @@ def download_video(
     safe_title = sanitize_filename(title or "video_download")
     timestamp = int(time.time() * 1000)
 
-    # Đặt template xuất file
+    # 1. Nếu có direct_url (như link TikTok không logo từ CDN)
+    if direct_url:
+        try:
+            ext = "mp3" if type == "audio" or format_id == "tiktok_audio" else "mp4"
+            out_filename = f"temp_{timestamp}.{ext}"
+            out_filepath = os.path.join(TEMP_DIR, out_filename)
+
+            req = urllib.request.Request(
+                direct_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                    "Referer": "https://www.tiktok.com/"
+                }
+            )
+            with urllib.request.urlopen(req, timeout=40) as resp, open(out_filepath, 'wb') as out_f:
+                shutil.copyfileobj(resp, out_f)
+
+            if (type == "audio" or format_id == "tiktok_audio") and FFMPEG_PATH:
+                mp3_filepath = os.path.join(TEMP_DIR, f"temp_{timestamp}_audio.mp3")
+                try:
+                    cmd = [FFMPEG_PATH, "-y", "-i", out_filepath, "-vn", "-b:a", "320k", mp3_filepath]
+                    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if os.path.exists(mp3_filepath):
+                        os.remove(out_filepath)
+                        out_filepath = mp3_filepath
+                except Exception:
+                    pass
+
+            background_tasks.add_task(cleanup_file, out_filepath)
+            media_type = "audio/mpeg" if ext == "mp3" else "video/mp4"
+            content_disposition = make_safe_content_disposition(safe_title, ext)
+
+            return FileResponse(
+                path=out_filepath,
+                media_type=media_type,
+                headers={
+                    "Content-Disposition": content_disposition
+                }
+            )
+        except Exception as e:
+            print(f"Direct download failed, fallback to yt-dlp: {e}")
+
+    # 2. Tải qua yt-dlp
     ext = "mp3" if type == "audio" or format_id == "mp3" else "mp4"
-    out_filename = f"{safe_title}_{timestamp}.{ext}"
-    out_filepath = os.path.join(TEMP_DIR, out_filename)
+    out_filename = f"temp_{timestamp}.%(ext)s"
 
     ydl_opts = get_base_ydl_opts()
-    ydl_opts['outtmpl'] = os.path.join(TEMP_DIR, f"{safe_title}_{timestamp}.%(ext)s")
+    ydl_opts['outtmpl'] = os.path.join(TEMP_DIR, out_filename)
 
     if type == "audio" or format_id == "mp3":
         ydl_opts['format'] = 'bestaudio/best'
@@ -271,10 +397,8 @@ def download_video(
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([clean_url])
 
-        # Tìm file thực tế đã được tải
-        matched_files = glob.glob(os.path.join(TEMP_DIR, f"{safe_title}_{timestamp}.*"))
+        matched_files = glob.glob(os.path.join(TEMP_DIR, f"temp_{timestamp}.*"))
         if not matched_files:
-            # Tìm file mới nhất trong thư mục temp
             files = [os.path.join(TEMP_DIR, f) for f in os.listdir(TEMP_DIR)]
             if files:
                 actual_file = max(files, key=os.path.getctime)
@@ -284,18 +408,16 @@ def download_video(
             actual_file = matched_files[0]
 
         actual_ext = os.path.splitext(actual_file)[1].lstrip(".")
-        download_filename = f"{safe_title}.{actual_ext}"
-
-        # Đăng ký xóa file tạm sau khi gửi
         background_tasks.add_task(cleanup_file, actual_file)
 
         media_type = "audio/mpeg" if actual_ext == "mp3" else "video/mp4"
+        content_disposition = make_safe_content_disposition(safe_title, actual_ext)
+
         return FileResponse(
             path=actual_file,
-            filename=download_filename,
             media_type=media_type,
             headers={
-                "Content-Disposition": f'attachment; filename="{download_filename}"'
+                "Content-Disposition": content_disposition
             }
         )
     except Exception as e:
@@ -318,7 +440,7 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     print("=" * 60)
-    print("  🚀 SNAPDOWNLOAD PRO V3 - KHỞI CHẠY HỆ THỐNG")
+    print("  🚀 SNAPDOWNLOAD PRO V3.2 - KHỞI CHẠY HỆ THỐNG")
     print(f"  FFmpeg: {'Đã sẵn sàng' if FFMPEG_PATH else 'Chưa tìm thấy'}")
     print("  Mở trình duyệt: http://localhost:8000")
     print("=" * 60)
