@@ -34,6 +34,12 @@ if os.path.exists(local_ffmpeg):
     FFMPEG_PATH = local_ffmpeg
 elif shutil.which("ffmpeg"):
     FFMPEG_PATH = shutil.which("ffmpeg")
+else:
+    try:
+        import imageio_ffmpeg
+        FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
 
 def format_size(bytes_val):
     if not bytes_val or bytes_val <= 0:
@@ -822,14 +828,28 @@ def download_media(
 
     raise HTTPException(status_code=500, detail="Không thể tải file media về máy!")
 
-# Static index.html fallback
-if os.path.exists(os.path.join(BASE_DIR, "index.html")):
-    @app.get("/")
-    def serve_root():
-        return FileResponse(os.path.join(BASE_DIR, "index.html"))
+# Favicon and Static index.html fallback
+@app.get("/favicon.ico", include_in_schema=False)
+def get_favicon():
+    fav_ico = os.path.join(BASE_DIR, "favicon.ico")
+    if os.path.exists(fav_ico):
+        return FileResponse(fav_ico, media_type="image/x-icon")
+    fav_svg = os.path.join(BASE_DIR, "favicon.svg")
+    if os.path.exists(fav_svg):
+        return FileResponse(fav_svg, media_type="image/svg+xml")
+    return Response(status_code=204)
 
+@app.get("/")
+def serve_root():
+    index_file = os.path.join(BASE_DIR, "index.html")
+    if os.path.exists(index_file):
+        return FileResponse(index_file, media_type="text/html")
+    return Response(content="<h1>taivideopro.onrender.com</h1><p>Frontend index.html not found.</p>", media_type="text/html")
+
+if os.path.exists(BASE_DIR):
     app.mount("/", StaticFiles(directory=BASE_DIR, html=True), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
