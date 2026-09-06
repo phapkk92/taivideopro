@@ -1,3 +1,27 @@
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Local environment & temporary folders
+.env
+.venv
+env/
 venv/
+ENV/
+temp_downloads/
+
+# Large binary files & Windows specific
+ffmpeg.exe
+*.zip
+.DS_Store
+Thumbs.db
+
+# Editor & IDE configs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log

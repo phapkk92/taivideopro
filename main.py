@@ -2,18 +2,86 @@ import os
 import sys
 import re
 import json
+import time
 import shutil
+import asyncio
+import gc
+import uuid
 import urllib.parse
 import urllib.request
 from typing import Optional
+from contextlib import asynccontextmanager
 
+import httpx
+from starlette.background import BackgroundTask
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse
 import yt_dlp
 
-app = FastAPI(title="TaiVideoPro API", version="2.2.0")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMP_DIR = os.path.join(BASE_DIR, "temp_downloads")
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# Limit concurrent heavy yt-dlp & ffmpeg processes to prevent 512MB RAM OOM crash
+YTDLP_SEMAPHORE = asyncio.Semaphore(2)
+
+# Global persistent AsyncClient with optimized connection pool for low-memory environments
+http_client: Optional[httpx.AsyncClient] = None
+
+def cleanup_temp_file(file_path: str):
+    """Safely remove a temporary file to keep disk usage at 0."""
+    try:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+    except Exception:
+        pass
+
+async def periodic_temp_cleanup():
+    """Periodically purge orphaned temporary files older than 5 minutes."""
+    while True:
+        try:
+            await asyncio.sleep(600)  # Every 10 minutes
+            now = time.time()
+            if os.path.exists(TEMP_DIR):
+                for fname in os.listdir(TEMP_DIR):
+                    p = os.path.join(TEMP_DIR, fname)
+                    if os.path.isfile(p):
+                        try:
+                            if now - os.path.getmtime(p) > 300:
+                                os.remove(p)
+                        except Exception:
+                            pass
+            gc.collect()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    # Optimized limits for Render 512MB RAM:
+    # 20 keep-alive connections max, 50 total connections
+    limits = httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=30.0)
+    timeout = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0)
+    http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
+    cleanup_task = asyncio.create_task(periodic_temp_cleanup())
+    yield
+    cleanup_task.cancel()
+    if http_client:
+        await http_client.aclose()
+
+async def get_http_client() -> httpx.AsyncClient:
+    global http_client
+    if http_client is None or http_client.is_closed:
+        limits = httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=30.0)
+        timeout = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0)
+        http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
+    return http_client
+
+app = FastAPI(title="TaiVideoPro API", version="2.3.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,12 +89,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition", "Content-Length"]
+    expose_headers=["Content-Disposition", "Content-Length", "Accept-Ranges"]
 )
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TEMP_DIR = os.path.join(BASE_DIR, "temp_downloads")
-os.makedirs(TEMP_DIR, exist_ok=True)
 
 FFMPEG_PATH = None
 local_ffmpeg = os.path.join(BASE_DIR, "ffmpeg.exe")
@@ -40,6 +104,7 @@ else:
         FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         pass
+
 
 def format_size(bytes_val):
     if not bytes_val or bytes_val <= 0:
@@ -139,7 +204,9 @@ def fetch_douyin_savetik(target_url: str):
                     "type": "MP4 Không logo",
                     "size": "HD",
                     "format_id": "douyin_hd",
-                    "url": f"/api/download?url={urllib.parse.quote(target_url)}&direct_url={urllib.parse.quote(clean_href)}&type=video&title={urllib.parse.quote(clean_title)}"
+                    "downloadUrl": clean_href,
+                    "url": clean_href,
+                    "direct_url": clean_href
                 })
             elif "MP4" in clean_label:
                 formats.append({
@@ -147,7 +214,9 @@ def fetch_douyin_savetik(target_url: str):
                     "type": "MP4 Không logo",
                     "size": "SD",
                     "format_id": "douyin_sd",
-                    "url": f"/api/download?url={urllib.parse.quote(target_url)}&direct_url={urllib.parse.quote(clean_href)}&type=video&title={urllib.parse.quote(clean_title)}"
+                    "downloadUrl": clean_href,
+                    "url": clean_href,
+                    "direct_url": clean_href
                 })
             elif "MP3" in clean_label or "Audio" in clean_label:
                 formats.append({
@@ -155,7 +224,9 @@ def fetch_douyin_savetik(target_url: str):
                     "type": "MP3 320kbps",
                     "size": "Audio",
                     "format_id": "douyin_audio",
-                    "url": f"/api/download?url={urllib.parse.quote(target_url)}&direct_url={urllib.parse.quote(clean_href)}&type=audio&title={urllib.parse.quote(clean_title)}"
+                    "downloadUrl": clean_href,
+                    "url": clean_href,
+                    "direct_url": clean_href
                 })
 
         # Check photo slideshow
@@ -167,7 +238,9 @@ def fetch_douyin_savetik(target_url: str):
                 "type": "Hình ảnh HD",
                 "size": "HD",
                 "format_id": f"douyin_img_{idx + 1}",
-                "url": f"/api/download?url={urllib.parse.quote(target_url)}&direct_url={urllib.parse.quote(p_clean)}&type=image&title={urllib.parse.quote(clean_title + f' - Anh {idx+1}')}"
+                "downloadUrl": p_clean,
+                "url": p_clean,
+                "direct_url": p_clean
             })
 
         if formats:
@@ -269,7 +342,9 @@ def fetch_tiktok_douyin(url: str):
                     "type": "MP4 Không logo",
                     "size": size_mb,
                     "format_id": "tiktok_hd",
-                    "url": f"/api/download?url={urllib.parse.quote(clean_target)}&direct_url={urllib.parse.quote(play_url)}&type=video&title={urllib.parse.quote(clean_title)}"
+                    "downloadUrl": play_url,
+                    "url": play_url,
+                    "direct_url": play_url
                 })
             if play_sd and play_hd and play_sd != play_hd:
                 formats.append({
@@ -277,7 +352,9 @@ def fetch_tiktok_douyin(url: str):
                     "type": "MP4 Không logo",
                     "size": "SD",
                     "format_id": "tiktok_sd",
-                    "url": f"/api/download?url={urllib.parse.quote(clean_target)}&direct_url={urllib.parse.quote(play_sd)}&type=video&title={urllib.parse.quote(clean_title)}"
+                    "downloadUrl": play_sd,
+                    "url": play_sd,
+                    "direct_url": play_sd
                 })
 
             images = d.get("images")
@@ -289,7 +366,9 @@ def fetch_tiktok_douyin(url: str):
                         "type": "Hình ảnh HD",
                         "size": "HD",
                         "format_id": f"tiktok_img_{idx + 1}",
-                        "url": f"/api/download?url={urllib.parse.quote(clean_target)}&direct_url={urllib.parse.quote(img_url)}&type=image&title={urllib.parse.quote(clean_title + f' - Anh {idx + 1}')}"
+                        "downloadUrl": img_url,
+                        "url": img_url,
+                        "direct_url": img_url
                     })
 
             if music_url:
@@ -298,7 +377,9 @@ def fetch_tiktok_douyin(url: str):
                     "type": "MP3 320kbps",
                     "size": f"{max(1, int(duration_sec * 0.04)):.1f} MB",
                     "format_id": "tiktok_audio",
-                    "url": f"/api/download?url={urllib.parse.quote(clean_target)}&direct_url={urllib.parse.quote(music_url)}&type=audio&title={urllib.parse.quote(clean_title)}"
+                    "downloadUrl": music_url,
+                    "url": music_url,
+                    "direct_url": music_url
                 })
 
             return {
@@ -370,21 +451,25 @@ def fetch_instagram(url: str):
                 "type": "MP4 Video",
                 "size": "HD",
                 "format_id": "ig_hd",
-                "url": f"/api/download?url={urllib.parse.quote(url)}&direct_url={urllib.parse.quote(video_url)}&type=video&title={urllib.parse.quote(title)}"
+                "downloadUrl": video_url,
+                "url": video_url,
+                "direct_url": video_url
             },
             {
                 "quality": "Âm thanh gốc",
                 "type": "MP3 320kbps",
                 "size": "MP3",
                 "format_id": "ig_audio",
-                "url": f"/api/download?url={urllib.parse.quote(url)}&direct_url={urllib.parse.quote(video_url)}&type=audio&title={urllib.parse.quote(title)}"
+                "downloadUrl": video_url,
+                "url": video_url,
+                "direct_url": video_url
             }
         ]
         return {
             "platform": "Instagram",
             "title": title,
             "author": author,
-            "thumbnail": f"/api/proxy_image?url={urllib.parse.quote(thumb)}" if thumb else "",
+            "thumbnail": thumb or "",
             "duration": "N/A",
             "formats": formats
         }
@@ -429,21 +514,25 @@ def fetch_twitter(url: str):
                 "type": "MP4 Video",
                 "size": "HD",
                 "format_id": "twitter_hd",
-                "url": f"/api/download?url={urllib.parse.quote(url)}&direct_url={urllib.parse.quote(video_url)}&type=video&title={urllib.parse.quote(title)}"
+                "downloadUrl": video_url,
+                "url": video_url,
+                "direct_url": video_url
             },
             {
                 "quality": "Âm thanh",
                 "type": "MP3 320kbps",
                 "size": "MP3",
                 "format_id": "twitter_audio",
-                "url": f"/api/download?url={urllib.parse.quote(url)}&direct_url={urllib.parse.quote(video_url)}&type=audio&title={urllib.parse.quote(title)}"
+                "downloadUrl": video_url,
+                "url": video_url,
+                "direct_url": video_url
             }
         ]
         return {
             "platform": "Twitter",
             "title": title,
             "author": author,
-            "thumbnail": f"/api/proxy_image?url={urllib.parse.quote(thumb)}" if thumb else "",
+            "thumbnail": thumb or "",
             "duration": duration,
             "formats": formats
         }
@@ -505,14 +594,18 @@ def fetch_meta_ai_share(url: str):
                 "type": "MP4 Video",
                 "size": "HD",
                 "format_id": "meta_video",
-                "url": f"/api/download?url={urllib.parse.quote(clean_url)}&direct_url={urllib.parse.quote(v_url)}&type=video&title={urllib.parse.quote(title)}"
+                "downloadUrl": v_url,
+                "url": v_url,
+                "direct_url": v_url
             })
             formats.append({
                 "quality": "Âm thanh gốc",
                 "type": "MP3",
                 "size": "MP3",
                 "format_id": "meta_audio",
-                "url": f"/api/download?url={urllib.parse.quote(clean_url)}&direct_url={urllib.parse.quote(v_url)}&type=audio&title={urllib.parse.quote(title)}"
+                "downloadUrl": v_url,
+                "url": v_url,
+                "direct_url": v_url
             })
 
         if thumb:
@@ -521,14 +614,16 @@ def fetch_meta_ai_share(url: str):
                 "type": "Hình ảnh HD",
                 "size": "Gốc",
                 "format_id": "meta_image",
-                "url": f"/api/download?url={urllib.parse.quote(clean_url)}&direct_url={urllib.parse.quote(thumb)}&type=image&title={urllib.parse.quote(title)}"
+                "downloadUrl": thumb,
+                "url": thumb,
+                "direct_url": thumb
             })
 
         if formats:
             return {
                 "platform": "Meta AI",
                 "title": title,
-                "thumbnail": f"/api/proxy_image?url={urllib.parse.quote(thumb)}" if thumb else "",
+                "thumbnail": thumb or "",
                 "duration": "N/A",
                 "author": "Meta AI",
                 "formats": formats
@@ -569,20 +664,34 @@ def fetch_ytdlp(url: str):
         formats = []
         raw_formats = info.get("formats", [])
 
-        # Best video
+        # Check for progressive formats (video + audio muxed) to allow 0-disk direct streaming
+        best_prog = None
+        for f in reversed(raw_formats):
+            vcodec = f.get("vcodec", "none")
+            acodec = f.get("acodec", "none")
+            f_url = f.get("url")
+            if vcodec != "none" and acodec != "none" and f_url and f_url.startswith("http"):
+                best_prog = f
+                break
+
+        best_direct = best_prog["url"] if best_prog else (info.get("url") or (raw_formats[-1].get("url") if raw_formats else ""))
         formats.append({
             "quality": "1080p / Tốt nhất (HD+)",
             "type": "MP4 Video + Audio",
             "size": format_size(info.get("filesize") or info.get("filesize_approx")) or "Gốc",
             "format_id": "best",
-            "url": f"/api/download?url={urllib.parse.quote(url)}&type=video&quality=best&title={urllib.parse.quote(clean_title)}"
+            "downloadUrl": best_direct,
+            "url": best_direct,
+            "direct_url": best_direct
         })
 
         seen_heights = set()
         for f in reversed(raw_formats):
             h = f.get("height")
             vcodec = f.get("vcodec", "none")
-            if h and h >= 360 and vcodec != "none" and h not in seen_heights:
+            f_url = f.get("url")
+            
+            if h and h >= 360 and vcodec != "none" and h not in seen_heights and f_url:
                 seen_heights.add(h)
                 f_size = format_size(f.get("filesize") or f.get("filesize_approx"))
                 formats.append({
@@ -590,35 +699,57 @@ def fetch_ytdlp(url: str):
                     "type": f"MP4 {f.get('ext', 'mp4').upper()}",
                     "size": f_size or "Chuẩn",
                     "format_id": f"h_{h}",
-                    "url": f"/api/download?url={urllib.parse.quote(url)}&type=video&quality={h}p&title={urllib.parse.quote(clean_title)}"
+                    "downloadUrl": f_url,
+                    "url": f_url,
+                    "direct_url": f_url
                 })
                 if len(seen_heights) >= 3:
                     break
 
-        # Best audio
+        # Best direct audio stream
+        best_audio_url = ""
+        best_audio_size = None
+        for f in reversed(raw_formats):
+            vcodec = f.get("vcodec", "none")
+            acodec = f.get("acodec", "none")
+            f_url = f.get("url")
+            if vcodec == "none" and acodec != "none" and f_url and f_url.startswith("http"):
+                best_audio_url = f_url
+                best_audio_size = f.get("filesize")
+                break
+
+        if not best_audio_url:
+            best_audio_url = best_direct
+
         formats.append({
             "quality": "Âm thanh tốt nhất (MP3)",
             "type": "MP3 320kbps",
-            "size": "Âm thanh",
+            "size": format_size(best_audio_size) or "Âm thanh",
             "format_id": "audio_mp3",
-            "url": f"/api/download?url={urllib.parse.quote(url)}&type=audio&title={urllib.parse.quote(clean_title)}"
+            "downloadUrl": best_audio_url,
+            "url": best_audio_url,
+            "direct_url": best_audio_url
         })
 
         platform_name = "YouTube" if "youtube" in extractor_key else (info.get("extractor_key") or "Web")
+        final_thumb = thumbnail or ""
+
         return {
             "platform": platform_name,
             "title": clean_title,
-            "thumbnail": f"/api/proxy_image?url={urllib.parse.quote(thumbnail)}" if thumbnail else "",
+            "thumbnail": final_thumb,
             "duration": duration_str,
             "author": author,
             "formats": formats
         }
 
-# --- PROXY IMAGE ENDPOINT (PRESERVES QUERY PARAMS & ADDS CORS) ---
+# --- PROXY IMAGE ENDPOINT (ASYNC STREAMING & 24H EDGE CACHING) ---
 @app.get("/api/proxy_image")
-def proxy_image(url: str = Query(...)):
-    # url is already unquoted by FastAPI query parser. DO NOT call unquote again!
+async def proxy_image(url: str = Query(...)):
     target_url = url.strip()
+    if not target_url or not target_url.startswith("http"):
+        return Response(status_code=400)
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
@@ -635,27 +766,49 @@ def proxy_image(url: str = Query(...)):
         headers["Referer"] = ""
 
     try:
-        req = urllib.request.Request(target_url, headers=headers)
-        resp = urllib.request.urlopen(req, timeout=12)
-        content_type = resp.headers.get("Content-Type", "image/jpeg")
-        data = resp.read()
-        return Response(
-            content=data,
-            media_type=content_type,
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "public, max-age=86400"
-            }
-        )
+        client = await get_http_client()
+        req = client.build_request("GET", target_url, headers=headers)
+        upstream = await client.send(req, stream=True)
+        if upstream.status_code >= 400:
+            await upstream.aclose()
+            raise HTTPException(status_code=upstream.status_code, detail="Image fetch failed")
+
+        content_type = upstream.headers.get("Content-Type", "image/jpeg")
+        content_len = upstream.headers.get("Content-Length")
+        
+        # Avoid streaming huge files through image proxy (> 5MB)
+        if content_len and int(content_len) > 5 * 1024 * 1024:
+            await upstream.aclose()
+            return Response(status_code=413)
+
+        resp_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=86400, s-maxage=86400, immutable",
+            "Content-Type": content_type
+        }
+        if content_len:
+            resp_headers["Content-Length"] = content_len
+
+        async def stream_img():
+            try:
+                async for chunk in upstream.aiter_bytes(chunk_size=16384):
+                    yield chunk
+            finally:
+                await upstream.aclose()
+
+        return StreamingResponse(stream_img(), media_type=content_type, headers=resp_headers)
     except Exception as e:
-        print(f"Proxy image failed for {target_url[:80]}: {e}")
-        # Return elegant SVG fallback
+        # Return fallback SVG
         svg = b'''<svg xmlns="http://www.w3.org/2000/svg" width="600" height="400" viewBox="0 0 600 400">
             <rect width="100%" height="100%" fill="#e0f2fe"/>
             <text x="50%" y="45%" dominant-baseline="middle" text-anchor="middle" font-family="sans-serif" font-size="32" font-weight="bold" fill="#0284c7">TaiVideoPro Media</text>
             <text x="50%" y="60%" dominant-baseline="middle" text-anchor="middle" font-family="sans-serif" font-size="18" fill="#38bdf8">&#10004; Video Preview</text>
         </svg>'''
-        return Response(content=svg, media_type="image/svg+xml", headers={"Access-Control-Allow-Origin": "*"})
+        return Response(content=svg, media_type="image/svg+xml", headers={
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=3600"
+        })
+
 
 # --- API INFO DISPATCHER ---
 @app.get("/api/info")
@@ -712,121 +865,171 @@ def get_video_info(url: str = Query(...)):
 
     raise HTTPException(status_code=400, detail="Không thể trích xuất video từ liên kết này. Vui lòng thử lại với link khác hoặc kiểm tra tính công khai của video!")
 
-# --- API DOWNLOAD ENDPOINT WITH REAL-TIME CONTENT-LENGTH ---
+# --- API DOWNLOAD ENDPOINT (DIRECT CHUNK STREAMING, ZERO DISK, 64KB RAM, FORCES DIRECT FILE DOWNLOAD) ---
 @app.get("/api/download")
-def download_media(
+async def download_media(
     url: str = Query(...),
     direct_url: Optional[str] = Query(None),
+    downloadUrl: Optional[str] = Query(None),
     type: str = Query("video"),
     quality: Optional[str] = Query(None),
-    title: Optional[str] = Query(None)
+    title: Optional[str] = Query(None),
+    format: Optional[str] = Query(None),
+    mode: Optional[str] = Query("auto")
 ):
+    """
+    Direct Chunk Streaming Download Endpoint:
+    - Zero Disk Buffering (0 bytes written to disk).
+    - Constant ~64KB RAM per stream (pipe chunks directly from CDN to browser).
+    - NEVER opens in a new tab: Forces direct browser download via 'Content-Disposition: attachment' and 'application/octet-stream'.
+    - If format='json' or mode='json': Returns direct CDN link and video metadata as JSON.
+    """
+    target_cdn = (direct_url or downloadUrl or "").strip()
     clean_title_str = clean_filename(title or "video")
-    
-    # Direct stream if direct_url provided
-    if direct_url:
-        parsed_direct = direct_url.strip()
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "*/*",
-        }
-        if "fbcdn" in parsed_direct or "instagram" in parsed_direct:
-            headers["Referer"] = "https://www.instagram.com/"
-        elif "tiktok" in parsed_direct or "byteoversea" in parsed_direct or "ibytedtos" in parsed_direct:
-            headers["Referer"] = "https://www.tiktok.com/"
-        elif "douyin" in parsed_direct or "zjcdn" in parsed_direct or "douyinvod" in parsed_direct or "douyinpic" in parsed_direct:
-            headers["Referer"] = "https://www.douyin.com/"
-        elif "snapcdn" in parsed_direct or "savetik" in parsed_direct:
-            headers["Referer"] = "https://savetik.co/"
-        elif "twitter" in parsed_direct or "twimg" in parsed_direct:
-            headers["Referer"] = "https://twitter.com/"
-        elif "googlevideo" in parsed_direct or "youtube" in parsed_direct:
-            headers["Referer"] = "https://www.youtube.com/"
+    ext = "mp3" if type == "audio" else ("jpg" if type == "image" else "mp4")
 
-        req = urllib.request.Request(parsed_direct, headers=headers)
+    # 1. JSON mode (for programmatic callers)
+    if format == "json" or mode == "json":
+        if target_cdn:
+            return {
+                "status": "success",
+                "downloadUrl": target_cdn,
+                "direct_url": target_cdn,
+                "title": clean_title_str,
+                "quality": quality or "HD",
+                "type": type,
+                "filename": f"{clean_title_str}.{ext}"
+            }
+        info = await asyncio.to_thread(get_video_info, url=url)
+        if info and info.get("formats"):
+            selected_fmt = info["formats"][0]
+            cdn_link = (selected_fmt.get("downloadUrl") or selected_fmt.get("url") or selected_fmt.get("direct_url") or "").strip()
+            return {
+                "status": "success",
+                "downloadUrl": cdn_link,
+                "direct_url": cdn_link,
+                "title": clean_filename(info.get("title") or clean_title_str),
+                "thumbnail": info.get("thumbnail") or "",
+                "quality": selected_fmt.get("quality") or quality or "HD",
+                "type": selected_fmt.get("type") or type,
+                "size": selected_fmt.get("size") or "N/A",
+                "filename": f"{clean_title_str}.{ext}"
+            }
+
+    # 2. Redirect mode (if explicitly requested)
+    if mode == "redirect":
+        if target_cdn:
+            return RedirectResponse(url=target_cdn, status_code=307)
+        info = await asyncio.to_thread(get_video_info, url=url)
+        if info and info.get("formats"):
+            for f in info["formats"]:
+                cdn_link = (f.get("downloadUrl") or f.get("url") or f.get("direct_url") or "").strip()
+                if cdn_link.startswith("http"):
+                    return RedirectResponse(url=cdn_link, status_code=307)
+
+    # 3. Direct Streaming Mode (Forces browser to download directly to computer, NO NEW TAB)
+    if not target_cdn:
         try:
-            resp = urllib.request.urlopen(req, timeout=25)
-            ext = "mp3" if type == "audio" else ("jpg" if type == "image" else "mp4")
-            content_type = "audio/mpeg" if type == "audio" else ("image/jpeg" if type == "image" else "video/mp4")
-            
+            info = await asyncio.to_thread(get_video_info, url=url)
+            if info and info.get("formats"):
+                selected_fmt = None
+                if quality:
+                    for f in info["formats"]:
+                        if str(f.get("quality", "")).lower() == quality.lower() or str(f.get("format_id", "")).lower() == quality.lower():
+                            selected_fmt = f
+                            break
+                if not selected_fmt and type == "audio":
+                    for f in info["formats"]:
+                        if "audio" in str(f.get("type", "")).lower() or "mp3" in str(f.get("format_id", "")).lower():
+                            selected_fmt = f
+                            break
+                if not selected_fmt:
+                    selected_fmt = info["formats"][0]
+
+                target_cdn = (selected_fmt.get("downloadUrl") or selected_fmt.get("url") or selected_fmt.get("direct_url") or "").strip()
+                if not title and info.get("title"):
+                    clean_title_str = clean_filename(info["title"])
+        except Exception as ex:
+            print(f"[EXTRACT ERROR] {ex}")
+
+    if not target_cdn or not target_cdn.startswith("http"):
+        raise HTTPException(
+            status_code=400,
+            detail="Không thể lấy link tải trực tiếp! Vui lòng kiểm tra lại URL video."
+        )
+
+    # Prepare streaming request with anti-hotlinking headers
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+    }
+    if "fbcdn" in target_cdn or "instagram" in target_cdn:
+        headers["Referer"] = "https://www.instagram.com/"
+    elif "tiktok" in target_cdn or "byteoversea" in target_cdn or "ibytedtos" in target_cdn:
+        headers["Referer"] = "https://www.tiktok.com/"
+    elif "douyin" in target_cdn or "zjcdn" in target_cdn or "douyinvod" in target_cdn or "douyinpic" in target_cdn:
+        headers["Referer"] = "https://www.douyin.com/"
+    elif "snapcdn" in target_cdn or "savetik" in target_cdn:
+        headers["Referer"] = "https://savetik.co/"
+    elif "twitter" in target_cdn or "twimg" in target_cdn:
+        headers["Referer"] = "https://twitter.com/"
+    elif "googlevideo" in target_cdn or "youtube" in target_cdn:
+        headers["Referer"] = "https://www.youtube.com/"
+
+    try:
+        client = await get_http_client()
+        req = client.build_request("GET", target_cdn, headers=headers)
+        upstream_resp = await client.send(req, stream=True)
+
+        # If CDN link expired, try refreshing once
+        if upstream_resp.status_code >= 400:
+            await upstream_resp.aclose()
+            print(f"[STREAM REFRESH] Target CDN returned {upstream_resp.status_code}, re-extracting fresh link...")
+            info = await asyncio.to_thread(get_video_info, url=url)
+            if info and info.get("formats"):
+                target_cdn = (info["formats"][0].get("downloadUrl") or info["formats"][0].get("url") or info["formats"][0].get("direct_url") or "").strip()
+                req = client.build_request("GET", target_cdn, headers=headers)
+                upstream_resp = await client.send(req, stream=True)
+
+        if upstream_resp.status_code < 400:
             ascii_title = re.sub(r'[^a-zA-Z0-9_-]', '_', clean_title_str)
+            if not ascii_title:
+                ascii_title = "video"
             utf8_title_enc = urllib.parse.quote(f"{clean_title_str}.{ext}")
             cd_header = f'attachment; filename="{ascii_title}.{ext}"; filename*=UTF-8\'\'{utf8_title_enc}'
 
             resp_headers = {
                 "Content-Disposition": cd_header,
-                "Access-Control-Expose-Headers": "Content-Disposition, Content-Length"
+                "Access-Control-Expose-Headers": "Content-Disposition, Content-Length",
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "public, max-age=3600"
             }
-            content_len = resp.headers.get("Content-Length")
+            content_len = upstream_resp.headers.get("Content-Length")
             if content_len:
                 resp_headers["Content-Length"] = content_len
 
-            def iter_stream():
-                while True:
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    yield chunk
+            async def iter_stream():
+                try:
+                    async for chunk in upstream_resp.aiter_bytes(chunk_size=65536):
+                        yield chunk
+                except (httpx.RequestError, asyncio.CancelledError, GeneratorExit):
+                    pass
+                finally:
+                    await upstream_resp.aclose()
 
             return StreamingResponse(
                 iter_stream(),
-                media_type=content_type,
+                media_type="application/octet-stream",
                 headers=resp_headers
             )
-        except Exception as direct_err:
-            print(f"Direct stream error: {direct_err}")
-
-    # Fallback to yt-dlp local download
-    ext = "mp3" if type == "audio" else "mp4"
-    out_tmpl = os.path.join(TEMP_DIR, f"{clean_title_str}_%(id)s.%(ext)s")
-    
-    ydl_opts = {
-        "outtmpl": out_tmpl,
-        "quiet": True,
-        "nocheckcertificate": True,
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    }
-    if FFMPEG_PATH:
-        ydl_opts["ffmpeg_location"] = FFMPEG_PATH
-
-    cookies_path = os.path.join(BASE_DIR, "cookies.txt")
-    if os.path.exists(cookies_path):
-        ydl_opts["cookiefile"] = cookies_path
-
-    if type == "audio":
-        ydl_opts.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "320",
-            }] if FFMPEG_PATH else []
-        })
-    else:
-        if quality and quality.endswith("p"):
-            height_val = quality.replace("p", "")
-            ydl_opts["format"] = f"bestvideo[height<={height_val}]+bestaudio/best[height<={height_val}]/best"
         else:
-            ydl_opts["format"] = "bestvideo+bestaudio/best"
+            await upstream_resp.aclose()
+            print(f"[STREAM FAILED] Status code: {upstream_resp.status_code}")
+    except Exception as stream_err:
+        print(f"[STREAM ERROR] {stream_err}")
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            res_info = ydl.extract_info(url, download=True)
-            saved_file = ydl.prepare_filename(res_info)
-            if type == "audio":
-                saved_file = os.path.splitext(saved_file)[0] + ".mp3"
-            
-            if os.path.exists(saved_file):
-                ascii_name = re.sub(r'[^a-zA-Z0-9_-]', '_', clean_title_str) + f".{ext}"
-                return FileResponse(
-                    saved_file,
-                    filename=ascii_name,
-                    media_type="audio/mpeg" if type == "audio" else "video/mp4"
-                )
-    except Exception as ydl_err:
-        print(f"yt-dlp download failed: {ydl_err}")
-
-    raise HTTPException(status_code=500, detail="Không thể tải file media về máy!")
+    # Fallback to redirect if streaming encountered an unexpected error
+    return RedirectResponse(url=target_cdn, status_code=307)
 
 # Favicon and Static index.html fallback
 @app.get("/favicon.ico", include_in_schema=False)

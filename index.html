@@ -91,84 +91,55 @@ Error generating stack: `+u.message+`
   let handleDownload = async (format) => {
     let fid = format.format_id || format.quality;
     setDownloadingId(fid);
-    setDownloadProgress(0);
+    setDownloadProgress(10);
     setDownloadOkId(null);
-    let fakeInterval = null;
 
-    try {
-      let resp = await fetch(format.url);
-      if (!resp.ok) throw new Error("Tải thất bại");
+    let directLink = format.downloadUrl || format.direct_url || format.url;
+    let ext = (format.type || "").includes("MP3") || (fid || "").includes("audio") ? "mp3" : "mp4";
+    let rawTitle = (o?.title || "video").trim().replace(/[\\/*?:"<>|]/g, "_").slice(0, 50);
+    let fname = `${rawTitle || "video"}.${ext}`;
+    if (!directLink) {
+      directLink = `/api/download?url=${encodeURIComponent(e)}&quality=${encodeURIComponent(format.quality || '')}&type=${encodeURIComponent(format.type || '')}&title=${encodeURIComponent(rawTitle)}`;
+    }
 
-      let contentLenHeader = resp.headers.get("Content-Length");
-      let totalBytes = contentLenHeader ? parseInt(contentLenHeader, 10) : 0;
-      let receivedBytes = 0;
-      let chunks = [];
+    // Cute monk knocking wooden fish progress animation
+    let curProgress = 20;
+    let progInterval = setInterval(() => {
+      curProgress = Math.min(95, curProgress + Math.floor(Math.random() * 20 + 15));
+      setDownloadProgress(curProgress);
+    }, 120);
 
-      if (!totalBytes || totalBytes <= 0) {
-        let cur = 10;
-        setDownloadProgress(10);
-        fakeInterval = setInterval(() => {
-          cur = Math.min(94, cur + Math.floor(Math.random() * 5 + 3));
-          setDownloadProgress(cur);
-        }, 250);
-      }
+    let dlEndpoint = `/api/download?url=${encodeURIComponent(e)}&direct_url=${encodeURIComponent(directLink || '')}&title=${encodeURIComponent(rawTitle)}&type=${encodeURIComponent(format.type || 'video')}&quality=${encodeURIComponent(format.quality || '')}`;
 
-      if (resp.body && resp.body.getReader) {
-        let reader = resp.body.getReader();
-        while (true) {
-          let { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value);
-          receivedBytes += value.length;
-          if (totalBytes > 0) {
-            let pct = Math.min(99, Math.round((receivedBytes / totalBytes) * 100));
-            setDownloadProgress(pct);
-          }
-        }
-      } else {
-        let blobData = await resp.blob();
-        chunks.push(blobData);
-      }
-
-      if (fakeInterval) clearInterval(fakeInterval);
+    setTimeout(() => {
+      if (progInterval) clearInterval(progInterval);
       setDownloadProgress(100);
 
-      let mimeType = resp.headers.get("Content-Type") || "application/octet-stream";
-      let finalBlob = new Blob(chunks, { type: mimeType });
-      let blobUrl = window.URL.createObjectURL(finalBlob);
-      let aElem = document.createElement("a");
-      aElem.href = blobUrl;
-
-      let disp = resp.headers.get("Content-Disposition");
-      let fname = "";
-      if (disp && disp.includes("filename*=")) {
-        let parts = disp.split("filename*=");
-        if (parts[1]) fname = decodeURIComponent(parts[1].split("''")[1] || parts[1]);
+      // Trigger instant direct download into user device (NO new tab, NO video player)
+      try {
+        let aElem = document.createElement("a");
+        aElem.style.display = "none";
+        aElem.href = dlEndpoint;
+        aElem.setAttribute("download", fname);
+        document.body.appendChild(aElem);
+        aElem.click();
+        setTimeout(() => {
+          try { document.body.removeChild(aElem); } catch(e) {}
+        }, 3000);
+      } catch(dlErr) {
+        let ifr = document.createElement("iframe");
+        ifr.style.display = "none";
+        ifr.src = dlEndpoint;
+        document.body.appendChild(ifr);
+        setTimeout(() => {
+          try { document.body.removeChild(ifr); } catch(e) {}
+        }, 30000);
       }
-      if (!fname && disp && disp.includes("filename=")) {
-        let parts = disp.split("filename=");
-        if (parts[1]) fname = parts[1].replace(/["']/g, "").trim();
-      }
-      if (!fname) {
-        let ext = (format.type || "").includes("MP3") || fid.includes("audio") ? "mp3" : "mp4";
-        fname = `${(o?.title || "video").slice(0, 40)}.${ext}`;
-      }
-      aElem.download = fname;
-      document.body.appendChild(aElem);
-      aElem.click();
-      window.URL.revokeObjectURL(blobUrl);
-      document.body.removeChild(aElem);
 
       setDownloadingId(null);
       setDownloadOkId(fid);
       setTimeout(() => setDownloadOkId(null), 4500);
-    } catch(dlErr) {
-      if (fakeInterval) clearInterval(fakeInterval);
-      window.location.href = format.url;
-      setDownloadingId(null);
-      setDownloadOkId(fid);
-      setTimeout(() => setDownloadOkId(null), 4500);
-    }
+    }, 600);
   };let h=async(overrideUrl)=>{let targetUrl=(typeof overrideUrl==="string"?overrideUrl:e).trim();if(!targetUrl){m.current?.focus();return}u(!0);setErr(null);i(null);try{let p=await fetch(`/api/info?url=${encodeURIComponent(targetUrl)}`);let data=await p.json();if(!p.ok){throw new Error(data.detail||"Không thể lấy video. Vui lòng kiểm tra lại đường dẫn!");}i(data)}catch(ex){setErr(ex.message||"Lỗi kết nối máy chủ backend")}finally{u(!1)}};let handlePaste=async()=>{try{let text=await navigator.clipboard.readText();if(text&&text.trim()){let c=text.trim();t(c);h(c)}else{m.current?.focus()}}catch(clErr){m.current?.focus()}};let handleInputPaste=(evt)=>{let text=evt.clipboardData?.getData("text")||"";if(text.trim()){let c=text.trim();t(c);setTimeout(()=>h(c),80)}};return C("div",{className:"min-h-screen w-full relative overflow-hidden font-[Inter] text-zinc-800 selection:bg-pink-200",children:[S("style",{children:`
         @import url('https://fonts.googleapis.com/css2?family=Fredoka:wght@600;700;800&family=Inter:wght@500;600;700&display=swap');
         @keyframes drift1 { 0% { transform: translateX(-10%) translateY(0px); } 50% { transform: translateX(10%) translateY(-8px); } 100% { transform: translateX(-10%) translateY(0px); } }
